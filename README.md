@@ -50,3 +50,14 @@ If browser execution yields `UNKNOWN`, call `/v1/attempts/unknown` and reconcile
 ## Credentials / PII
 
 Only random keys in a private environment store, never in GitHub or client JS. All applicant data remains private in CareerOS; PathLattice carries public signals only. Keep `CAREEROS_ALLOW_LOCAL_DB` unset in Vercel production.
+
+## V2 staged bridge amendments (not production release)
+
+- `src/consent.py` verifies a signed **job + candidate + exact packet + authenticated-session + expiry** proof. Signing must happen only in a separate identity-verified approval service; no endpoint in this public repo can issue a signed approval. A service key is not proof that the applicant approved unless the external service is verified.
+- `src/store.py` contains `PostgresStore` using a bounded SQLAlchemy/psycopg pool when `DATABASE_URL` is configured; local SQLite requires explicit `CAREEROS_ALLOW_LOCAL_DB=1`. PostgreSQL schema must be migrated and integration-tested before any deployment.
+- `migrations/001_extensions.sql` through `007_indexes.sql` separate the staging schema into reviewable migration units. **The original Neon approvals-table DDL was blocked by a safety tool and was not force-applied.** Split files are for transparent review and an approved deployment path, not a bypass.
+- `src/tinyfish_bridge.py` implements a permission check and truthful browser outcome classification. It does **not** invoke TinyFish remotely, submit ATS forms, or count displayed success as a receipt.
+- `src/gmail_receipts.py` classifies *potential* email confirmations for independent review. Gmail notifications are not provider proof by themselves.
+- Production `CareerOS v0.4.0` and the canonical Library remain separate. No redeployment, applicant email, employer ATS submit or production migration has occurred.
+
+Security configuration (all private, never frontend/public repo): `DATABASE_URL`, `CAREEROS_API_KEY`, `CAREEROS_APPROVAL_VERIFIER_KEY`, `CAREEROS_CONSENT_HMAC_KEY`, `CAREEROS_RECEIPT_VERIFIER_KEY`. Never use fake tokens in a live deployment. Per-role user approval still applies. Testing can use the fake fixture signer inside `src/consent.py` only locally.
