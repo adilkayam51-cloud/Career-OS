@@ -1,0 +1,1 @@
+"""CareerOS approval and receipt gateway; no automated ATS submission."""
