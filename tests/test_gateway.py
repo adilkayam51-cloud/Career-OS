@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from src import main
+from src.consent import issue_for_trusted_tests
+from src.core import packet_hash
 
 client = TestClient(main.app)
 API='A'*40
@@ -24,6 +26,7 @@ def provision(monkeypatch, tmp_path):
     monkeypatch.setenv('CAREEROS_API_KEY',API)
     monkeypatch.setenv('CAREEROS_APPROVAL_VERIFIER_KEY',APPROVAL)
     monkeypatch.setenv('CAREEROS_RECEIPT_VERIFIER_KEY',RECEIPT)
+    monkeypatch.setenv('CAREEROS_CONSENT_HMAC_KEY','D'*40)
     main.store.cache_clear()
 
 
@@ -44,11 +47,21 @@ def get_job_key():
 
 
 def approve(key):
+    from src.store import SQLiteStore
+    from src.core import role_key
+    from src.consent import issue_for_trusted_tests
+    with main.store().connection() as conn:
+        job=main.store().get_job(conn,key)
+    ph=packet_hash(job,'a'*64,{'notice_period':'user supplied'},
+                   'The exact visible terms presented to this candidate')
+    token=issue_for_trusted_tests(secret='D'*40, job_key=key,packet_hash=ph,
+                                  candidate_id=job['candidate_id'],session_id='trusted-session-123')
     return client.post('/v1/approvals',headers=APP_HEAD,json={
         'job_key':key,'cv_sha256':'a'*64,'form_answers':{'notice_period':'user supplied'},
         'terms_text':'The exact visible terms presented to this candidate',
         'consent_to_terms':True,'consent_to_bgv_if_applicable':True,
-        'approver':'independently-verified-human','authorizes_exact_packet':True})
+        'approver':'independently-verified-human','authorizes_exact_packet':True,
+        'consent_proof':token,'verified_session_id':'trusted-session-123'})
 
 
 def test_missing_secrets_fail_closed(monkeypatch):
@@ -77,7 +90,8 @@ def test_approval_requires_independent_secret(monkeypatch,tmp_path):
     key=get_job_key()
     payload={'job_key':key,'cv_sha256':'a'*64, 'form_answers':{},
         'terms_text':'BGV and final agreement','consent_to_terms':True,'consent_to_bgv_if_applicable':True,
-        'approver':'human','authorizes_exact_packet':True}
+        'approver':'human','authorizes_exact_packet':True,'consent_proof':'invalid-proof-for-test',
+        'verified_session_id':'trusted-session-123'}
     r=client.post('/v1/approvals',headers=HEAD,json=payload)
     assert r.status_code==401
     assert approve(key).status_code==200
@@ -149,3 +163,50 @@ def test_no_fake_receipt_before_authorization(monkeypatch,tmp_path):
         'exact_job_identity_checked':True}
     result=client.post('/v1/receipts/attest',json=data,headers=RECEIPT_HEAD)
     assert result.status_code==403
+
+
+def test_signed_consent_rejects_tamper_and_expiry():
+    from src.consent import issue_for_trusted_tests, verify
+    now=datetime.now(timezone.utc)
+    fields={'secret':'D'*40,'job_key':'a'*64,'packet_hash':'b'*64,
+            'candidate_id':'test-candidate','session_id':'trusted-session-123'}
+    valid=issue_for_trusted_tests(**fields,now=now)
+    assert verify(valid,**fields,now=now)
+    assert not verify(valid,**{**fields,'packet_hash':'c'*64},now=now)
+    assert not verify(valid,**{**fields,'session_id':'another-session-888'},now=now)
+    assert not verify(valid[:-3]+'abc',**fields,now=now)
+    assert not verify(valid,**fields,now=now+timedelta(minutes=11))
+
+
+def test_changed_job_after_attempt_must_be_reconciled(monkeypatch,tmp_path):
+    provision(monkeypatch,tmp_path)
+    key=get_job_key()
+    ph=approve(key).json()['packet_hash']
+    assert client.post('/v1/attempts/authorize',json={'job_key':key,'packet_hash':ph},headers=HEAD).status_code==200
+    changed=a_job();changed['jd_url']='https://job-boards.greenhouse.io/example/jobs/new'
+    assert client.post('/v1/jobs',json=changed,headers=HEAD).status_code==409
+
+
+def test_bridge_fails_closed_and_no_browser_result_is_counted():
+    from src.tinyfish_bridge import guarded_handoff,classify_browser_result
+    role={'job_key':'x','provider_job_id':'123','jd_url':'https://example.com/job'}
+    import pytest
+    with pytest.raises(PermissionError):
+        guarded_handoff(approved_packet_hash='abc',actual_packet_hash='changed',status='AUTHORIZED',role=role,form={},run_id='run-1')
+    handoff=guarded_handoff(approved_packet_hash='abc',actual_packet_hash='abc',status='AUTHORIZED',role=role,form={},run_id='run-1')
+    assert handoff.approval_checked
+    for obj in ({'run_id':'run-1','reported_success_url':'https://example.com/success'},
+                {'run_id':'run-1','captcha_required':True},
+                {'run_id':'run-1','uncertain_submission':True}):
+        assert classify_browser_result(obj)['countable'] is False
+
+
+def test_gmail_classification_only_queues_for_independent_receipt_review():
+    from src.gmail_receipts import classify
+    msg={'message_id':'gmail-123','received_at':'2026-10-26T00:00:00Z',
+         'subject':'Your Example Co application was received',
+         'body':'Example Co receipt, job id 1234: thank you for applying'}
+    result=classify(msg,{'1234':'Example Co'})
+    assert result['candidate_job_ids']==['1234']
+    assert result['status']=='REVIEW_PROVIDER_EMAIL'
+    assert not result['provider_confirmed']
