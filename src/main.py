@@ -17,15 +17,19 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .core import eligibility_issues, ist_day, now_utc, packet_hash, role_key, sha
-from .store import SQLiteStore
+from .store import SQLiteStore, PostgresStore
+from .consent import verify as verify_consent
 
 app = FastAPI(title='CareerOS Guarded Integration — Staging', version='0.1.0',
               description='Approval/receipt state gateway only. This API DOES NOT apply to jobs.')
 
 @lru_cache(maxsize=1)
 def store():
+    db_url = os.getenv('DATABASE_URL','').strip()
+    if db_url:
+        return PostgresStore(db_url)
     if os.getenv('CAREEROS_ALLOW_LOCAL_DB') != '1':
-        raise HTTPException(status_code=503, detail='Durable Neon backend not wired. Local SQLite disabled in production.')
+        raise HTTPException(status_code=503, detail='No configured PostgreSQL database; local SQLite disabled.')
     return SQLiteStore(os.getenv('CAREEROS_TEST_DB_PATH','/tmp/careeros_approval_staging.sqlite3'))
 
 
@@ -103,6 +107,8 @@ class Approval(BaseModel):
     consent_to_bgv_if_applicable: bool
     approver: str = Field(min_length=3,max_length=120)
     authorizes_exact_packet: bool
+    consent_proof: str = Field(min_length=20,max_length=2800)
+    verified_session_id: str = Field(min_length=12,max_length=160)
 
 
 class Attempt(BaseModel):
@@ -154,7 +160,8 @@ def health():
             'approval_auth_configured':len(os.getenv('CAREEROS_APPROVAL_VERIFIER_KEY',''))>=32,
             'local_db_test_enabled':os.getenv('CAREEROS_ALLOW_LOCAL_DB')=='1',
             'ats_submit_capability':False,
-            'production_neon_write_capability':False}
+            'postgres_configured':bool(os.getenv('DATABASE_URL','').strip()),
+            'receipt_provider_verification_external':True}
 
 @app.post('/v1/jobs',dependencies=[Depends(api_guard)])
 def upsert_job(job:Job):
@@ -166,6 +173,11 @@ def upsert_job(job:Job):
         db.execute('BEGIN IMMEDIATE')
         old=store().get_job(db,key)
         if old and old!=data:
+            # Once an external attempt may exist, role identity and lane are immutable.
+            attempted = db.execute('SELECT 1 FROM attempts WHERE job_key=?',(key,)).fetchone()
+            receipted = db.execute('SELECT 1 FROM receipts WHERE job_key=?',(key,)).fetchone()
+            if attempted or receipted:
+                raise HTTPException(status_code=409,detail='Existing attempt/receipt requires explicit reconciliation, not job mutation')
             # Updating a JD or hiring terms invalidates any consent and previous packet.
             db.execute('UPDATE approvals SET invalidated=1 WHERE job_key=?',(key,))
             store().event(db,key,'PACKET_INVALIDATED',stamp,{'reason':'job_changed'})
@@ -191,6 +203,14 @@ def approve(approval:Approval):
         a=db.execute('SELECT status FROM attempts WHERE job_key=?',(approval.job_key,)).fetchone()
         if a: raise HTTPException(status_code=409,detail='Existing attempt must be reconciled first')
         ph=packet_hash(job,approval.cv_sha256,approval.form_answers,approval.terms_text)
+        consent_secret = os.getenv('CAREEROS_CONSENT_HMAC_KEY','')
+        if len(consent_secret) < 32:
+            raise HTTPException(status_code=503,detail='Independent consent-signing service not configured')
+        if not verify_consent(approval.consent_proof,secret=consent_secret,
+                              job_key=approval.job_key,packet_hash=ph,
+                              candidate_id=job['candidate_id'],
+                              session_id=approval.verified_session_id):
+            raise HTTPException(status_code=403,detail='Invalid, expired, or non-matching signed consent')
         db.execute('INSERT INTO approvals(job_key,packet_hash,cv_sha256,answers_json,terms_hash,approved_at,approver,invalidated) VALUES(?,?,?,?,?,?,?,0) ON CONFLICT(job_key) DO UPDATE SET packet_hash=excluded.packet_hash,cv_sha256=excluded.cv_sha256,answers_json=excluded.answers_json,terms_hash=excluded.terms_hash,approved_at=excluded.approved_at,approver=excluded.approver,invalidated=0',
                    (approval.job_key,ph,approval.cv_sha256,__import__('json').dumps(approval.form_answers),sha(approval.terms_text),stamp,approval.approver))
         store().event(db,approval.job_key,'EXACT_PACKET_APPROVED',stamp,{'packet_hash':ph,'approver':approval.approver})
@@ -254,7 +274,7 @@ def scorecard(candidate_id:str,day:str|None=None):
         rows=db.execute('SELECT j.lane,COUNT(*) AS n FROM receipts r JOIN jobs j ON j.job_key=r.job_key WHERE j.candidate_id=? AND r.submitted_ist_day=? GROUP BY j.lane',(candidate_id,day)).fetchall()
     lanes={r['lane']:r['n'] for r in rows}
     a=lanes.get('remote',0);b=lanes.get('geographic',0)
-    return {'day_ist':day,'remote_confirmed':a,'remote_goal':10,'geographic_confirmed':b,'geographic_goal':10,'total_confirmed':a+b,'daily_goal':20,'backend':'local-test-only'}
+    return {'day_ist':day,'remote_confirmed':a,'remote_goal':10,'geographic_confirmed':b,'geographic_goal':10,'total_confirmed':a+b,'daily_goal':20,'backend':'neon' if os.getenv('DATABASE_URL') else 'local-test-only'}
 
 @app.get('/v1/audit/{job_key}',dependencies=[Depends(api_guard)])
 def audit(job_key:str):
@@ -264,4 +284,4 @@ def audit(job_key:str):
         receipt=db.execute('SELECT submitted_ist_day,evidence_type,verified_at FROM receipts WHERE job_key=?',(job_key,)).fetchone()
     return {'job_key':job_key,'attempt_state':state['status'] if state else None,
             'receipt_present':bool(receipt),'receipt_metadata':dict(receipt) if receipt else None,
-            'events':[{'event':r['event_type'],'data':__import__('json').loads(r['metadata_json']),'at':r['recorded_at']} for r in events]}
+            'events':[{'event':r['event_type'],'data':(__import__('json').loads(r['metadata_json']) if isinstance(r['metadata_json'],str) else r['metadata_json']),'at':r['recorded_at']} for r in events]}
