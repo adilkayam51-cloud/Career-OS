@@ -129,7 +129,7 @@ def parse_public_jobs(board: Board, data: object) -> list[Lead]:
         safe_url = _safe_https_link(url)
         if not (job_id and _safe_str(name) and safe_url):
             continue
-        remote_flag = bool(item.get("isRemote")) or "remote" in _safe_str(location).lower()
+        remote_flag = item.get("isRemote") is True or "remote" in _safe_str(location).lower()
         leads.append(Lead(board.provider, board.slug, job_id, _safe_str(name),
                           safe_url, _safe_str(location), remote_flag))
     return leads
